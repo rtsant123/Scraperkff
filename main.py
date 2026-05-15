@@ -42,6 +42,7 @@ def save_sent(data):
         json.dump(data, f)
 
 def format_result(raw):
+    """4565 -> 456-5, already formatted stays as is"""
     raw = raw.strip()
     if len(raw) == 4 and raw.isdigit():
         return f"{raw[:3]}-{raw[3]}"
@@ -50,20 +51,19 @@ def format_result(raw):
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={
+        r = requests.post(url, json={
             "chat_id": CHANNEL_ID,
             "text": message
         }, timeout=10)
+        print(f"Telegram response: {r.status_code} {r.text}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
 def parse_header_date(header):
-    # Match dd/mm/yyyy
     date_match = re.search(r'(\d{2}/\d{2}/\d{4})', header)
     if date_match:
         return date_match.group(1)
 
-    # Match "(FRIDAY, 15 MAY 2026)" or "FRIDAY, 15 MAY 2026"
     today_match = re.search(r'\(?(\w+),?\s*(\d{1,2})\s+(\w+)\s+(\d{4})\)?', header)
     if today_match:
         day = today_match.group(2).zfill(2)
@@ -77,8 +77,18 @@ def parse_header_date(header):
         month = months.get(month_str, "00")
         if month != "00":
             return f"{day}/{month}/{year}"
-
     return None
+
+def extract_bazis(rows):
+    cells = rows[1].find_all("td")
+    bazis = []
+    for cell in cells:
+        text = cell.get_text(strip=True)
+        digits = re.sub(r'[^0-9]', '', text)
+        if len(digits) == 4:
+            # Store in formatted form immediately
+            bazis.append(f"{digits[:3]}-{digits[3]}")
+    return bazis
 
 def parse_tables(soup, data, sent, notify=False):
     today_key = get_ist_now().strftime("%d/%m/%Y")
@@ -91,18 +101,10 @@ def parse_tables(soup, data, sent, notify=False):
 
         header = rows[0].get_text(strip=True)
         date_key = parse_header_date(header)
-
         if not date_key:
             continue
 
-        cells = rows[1].find_all("td")
-        bazis = []
-        for cell in cells:
-            text = cell.get_text(strip=True)
-            text = re.sub(r'[^0-9]', '', text)  # strip everything except digits
-            if len(text) == 4:  # exactly 4 digits = valid result
-                bazis.append(text)
-
+        bazis = extract_bazis(rows)
         if not bazis:
             continue
 
@@ -112,16 +114,15 @@ def parse_tables(soup, data, sent, notify=False):
             for i, bazi in enumerate(bazis):
                 if bazi not in sent_bazis:
                     bazi_time = BAZI_TIMES[i] if i < len(BAZI_TIMES) else "--:--"
-                    formatted = format_result(bazi)
                     msg = (
                         f"Kolkata FF Update\n"
                         f"Date: {date_key}\n"
                         f"Time: {bazi_time}\n"
-                        f"Result: {formatted}"
+                        f"Result: {bazi}"
                     )
                     send_telegram(msg)
                     sent_bazis.append(bazi)
-                    print(f"Telegram sent: {date_key} Bazi {i+1} = {formatted}")
+                    print(f"Sent: {date_key} Bazi {i+1} = {bazi}")
 
         data[date_key] = bazis
         sent[date_key] = sent_bazis
@@ -135,16 +136,11 @@ def scrape_month(month_name, year, data, sent):
         parse_tables(soup, data, sent, notify=False)
         print(f"Scraped history: {month_name} {year}")
     except Exception as e:
-        print(f"Error scraping {month_name} {year}: {e}")
+        print(f"Error: {month_name} {year}: {e}")
 
 def scrape_history():
     data = load_data()
     sent = load_sent()
-
-    # Mark all existing as sent — no spam
-    for date_key, bazis in data.items():
-        if date_key not in sent:
-            sent[date_key] = bazis[:]
 
     month_names = ["January","February","March","April","May","June",
                    "July","August","September","October","November","December"]
@@ -154,7 +150,7 @@ def scrape_history():
         d = today - timedelta(days=30*i)
         scrape_month(month_names[d.month - 1], d.year, data, sent)
 
-    # Mark all as sent after history load
+    # Mark everything as sent — no spam on startup
     for date_key, bazis in data.items():
         sent[date_key] = bazis[:]
 
@@ -172,14 +168,13 @@ def scrape():
         parse_tables(soup, data, sent, notify=True)
         save_data(data)
         save_sent(sent)
-        print(f"[{get_ist_now().strftime('%d/%m/%Y %H:%M')} IST] Scraped OK — {len(data)} days")
+        print(f"[{get_ist_now().strftime('%d/%m/%Y %H:%M')} IST] OK — {len(data)} days")
     except Exception as e:
         print(f"Scrape error: {e}")
 
 @app.route("/")
 def index():
-    ist = get_ist_now().strftime("%d/%m/%Y %H:%M IST")
-    return f"Kolkata FF Scraper Running — {ist}"
+    return f"Kolkata FF Scraper — {get_ist_now().strftime('%d/%m/%Y %H:%M IST')}"
 
 @app.route("/results")
 def results():
@@ -197,15 +192,6 @@ def today():
     today_key = get_ist_now().strftime("%d/%m/%Y")
     return jsonify({today_key: data.get(today_key, [])})
 
-@app.route("/reset-sent")
-def reset_sent():
-    data = load_data()
-    sent = {}
-    for date_key, bazis in data.items():
-        sent[date_key] = bazis[:]
-    save_sent(sent)
-    return f"Done — {len(sent)} dates marked as sent. Old spam stopped."
-
 @app.route("/debug")
 def debug():
     ist = get_ist_now()
@@ -216,9 +202,30 @@ def debug():
         "ist_time": ist.strftime("%d/%m/%Y %H:%M:%S"),
         "today_key": today_key,
         "today_results": data.get(today_key, []),
-        "total_days": len(data),
-        "today_sent": sent.get(today_key, [])
+        "today_sent": sent.get(today_key, []),
+        "total_days": len(data)
     })
+
+@app.route("/reset-sent")
+def reset_sent():
+    data = load_data()
+    sent = {}
+    for date_key, bazis in data.items():
+        sent[date_key] = bazis[:]
+    save_sent(sent)
+    return f"Done — {len(sent)} dates marked sent."
+
+@app.route("/force-send-today")
+def force_send_today():
+    """Hit this to force resend today's results to Telegram"""
+    data = load_data()
+    sent = load_sent()
+    today_key = get_ist_now().strftime("%d/%m/%Y")
+    # Clear today from sent so it resends
+    sent[today_key] = []
+    save_sent(sent)
+    scrape()
+    return f"Forced resend for {today_key}"
 
 if __name__ == "__main__":
     scrape_history()
