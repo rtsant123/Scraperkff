@@ -14,6 +14,8 @@ SENT_FILE = "/app/data/sent.json"
 TELEGRAM_TOKEN = "8462761178:AAFH3KWgqk4tgJfYM3yyQasS7i3co-JaErg"
 CHANNEL_ID = "-1003757967990"
 
+BAZI_TIMES = ["10:00","11:30","13:00","14:30","16:00","17:30","19:00","20:30"]
+
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
@@ -41,14 +43,15 @@ def send_telegram(message):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, json={
             "chat_id": CHANNEL_ID,
-            "text": message,
-            "parse_mode": "HTML"
+            "text": message
         }, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
 
 def parse_tables(soup, data, sent, notify=False):
+    today_key = datetime.now().strftime("%d/%m/%Y")
     tables = soup.find_all("table")
+
     for table in tables:
         rows = table.find_all("tr")
         if not rows:
@@ -91,14 +94,16 @@ def parse_tables(soup, data, sent, notify=False):
 
         sent_bazis = sent.get(date_key, [])
 
-        if notify:
+        # Only send Telegram for TODAY's new results
+        if notify and date_key == today_key:
             for i, bazi in enumerate(bazis):
                 if bazi not in sent_bazis:
+                    bazi_time = BAZI_TIMES[i] if i < len(BAZI_TIMES) else "--:--"
                     msg = (
-                        f"🎯 <b>Kolkata FF Update</b>\n"
-                        f"📅 Date: {date_key}\n"
-                        f"🕐 Bazi {i+1}\n"
-                        f"🔢 Result: <b>{bazi}</b>"
+                        f"Kolkata FF Update\n"
+                        f"Date: {date_key}\n"
+                        f"Time: {bazi_time}\n"
+                        f"Result: {bazi}"
                     )
                     send_telegram(msg)
                     sent_bazis.append(bazi)
@@ -106,29 +111,19 @@ def parse_tables(soup, data, sent, notify=False):
         data[date_key] = bazis
         sent[date_key] = sent_bazis
 
-def scrape_month(month_name, year, data, sent, notify=False):
+def scrape_month(month_name, year, data, sent):
     try:
         url = f"https://kolkataff.tv/old-kolkata-ff-fatafat-result/monthly/index.php?month={month_name}&year={year}"
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(res.text, "html.parser")
-        parse_tables(soup, data, sent, notify=notify)
-        print(f"Scraped {month_name} {year}")
+        parse_tables(soup, data, sent, notify=False)
+        print(f"Scraped history: {month_name} {year}")
     except Exception as e:
         print(f"Error scraping {month_name} {year}: {e}")
 
-def scrape_homepage(data, sent, notify=True):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get("https://kolkataff.tv/", headers=headers, timeout=15)
-        soup = BeautifulSoup(res.text, "html.parser")
-        parse_tables(soup, data, sent, notify=notify)
-        print(f"[{datetime.now()}] Homepage scraped")
-    except Exception as e:
-        print(f"Homepage error: {e}")
-
 def scrape_history():
-    """Run once on startup — scrapes last 3 months, no Telegram spam"""
+    """Runs once on startup — loads 3 months, no Telegram"""
     data = load_data()
     sent = load_sent()
 
@@ -138,20 +133,27 @@ def scrape_history():
     today = datetime.now()
     for i in range(3):
         d = today - timedelta(days=30*i)
-        scrape_month(month_names[d.month - 1], d.year, data, sent, notify=False)
+        scrape_month(month_names[d.month - 1], d.year, data, sent)
 
     save_data(data)
     save_sent(sent)
-    print(f"History load done — {len(data)} days stored")
+    print(f"History loaded — {len(data)} days stored")
 
 def scrape():
-    """Runs every 90 mins — only homepage, sends Telegram for new results"""
+    """Runs every 90 mins — sends Telegram only for today's new bazis"""
     data = load_data()
     sent = load_sent()
-    scrape_homepage(data, sent, notify=True)
-    save_data(data)
-    save_sent(sent)
-    print(f"[{datetime.now()}] Scraped OK — {len(data)} days stored")
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get("https://kolkataff.tv/", headers=headers, timeout=15)
+        soup = BeautifulSoup(res.text, "html.parser")
+        parse_tables(soup, data, sent, notify=True)
+        save_data(data)
+        save_sent(sent)
+        print(f"[{datetime.now()}] Scraped OK — {len(data)} days stored")
+    except Exception as e:
+        print(f"Scrape error: {e}")
 
 @app.route("/")
 def index():
@@ -174,8 +176,8 @@ def today():
     return jsonify({today_key: data.get(today_key, [])})
 
 if __name__ == "__main__":
-    scrape_history()   # Load 3 months silently on startup
-    scrape()           # Then scrape homepage + start Telegram
+    scrape_history()  # Silent — no Telegram
+    scrape()          # Today only — Telegram fires for new bazis
     scheduler = BackgroundScheduler()
     scheduler.add_job(scrape, "interval", minutes=90)
     scheduler.start()
