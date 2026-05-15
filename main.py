@@ -16,6 +16,9 @@ CHANNEL_ID = "-1003757967990"
 
 BAZI_TIMES = ["10:00","11:30","13:00","14:30","16:00","17:30","19:00","20:30"]
 
+def get_ist_now():
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
@@ -38,6 +41,13 @@ def save_sent(data):
     with open(SENT_FILE, "w") as f:
         json.dump(data, f)
 
+def format_result(raw):
+    """Split 4-digit result into patti (3) + single (1). e.g. 4565 -> 456-5"""
+    raw = raw.strip()
+    if len(raw) == 4 and raw.isdigit():
+        return f"{raw[:3]}-{raw[3]}"
+    return raw
+
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -48,37 +58,36 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
+def parse_header_date(header):
+    date_match = re.search(r'(\d{2}/\d{2}/\d{4})', header)
+    today_match = re.search(r'(\w+),\s*(\d+)\s*(\w+)\s*(\d{4})', header)
+
+    if date_match:
+        return date_match.group(1)
+    elif today_match:
+        day = today_match.group(2).zfill(2)
+        month_str = today_match.group(3).upper()
+        year = today_match.group(4)
+        months = {
+            "JANUARY":"01","FEBRUARY":"02","MARCH":"03","APRIL":"04",
+            "MAY":"05","JUNE":"06","JULY":"07","AUGUST":"08",
+            "SEPTEMBER":"09","OCTOBER":"10","NOVEMBER":"11","DECEMBER":"12"
+        }
+        month = months.get(month_str, "00")
+        return f"{day}/{month}/{year}"
+    return None
+
 def parse_tables(soup, data, sent, notify=False):
-    today_key = datetime.now().strftime("%d/%m/%Y")
+    today_key = get_ist_now().strftime("%d/%m/%Y")
     tables = soup.find_all("table")
 
     for table in tables:
         rows = table.find_all("tr")
-        if not rows:
-            continue
-
-        header = rows[0].get_text(strip=True)
-
-        date_match = re.search(r'(\d{2}/\d{2}/\d{4})', header)
-        today_match = re.search(r'(\w+),\s*(\d+)\s*(\w+)\s*(\d{4})', header)
-
-        if date_match:
-            date_key = date_match.group(1)
-        elif today_match:
-            day = today_match.group(2).zfill(2)
-            month_str = today_match.group(3).upper()
-            year = today_match.group(4)
-            months = {
-                "JANUARY":"01","FEBRUARY":"02","MARCH":"03","APRIL":"04",
-                "MAY":"05","JUNE":"06","JULY":"07","AUGUST":"08",
-                "SEPTEMBER":"09","OCTOBER":"10","NOVEMBER":"11","DECEMBER":"12"
-            }
-            month = months.get(month_str, "00")
-            date_key = f"{day}/{month}/{year}"
-        else:
-            continue
-
         if len(rows) < 2:
+            continue
+
+        date_key = parse_header_date(rows[0].get_text(strip=True))
+        if not date_key:
             continue
 
         cells = rows[1].find_all("td")
@@ -86,7 +95,8 @@ def parse_tables(soup, data, sent, notify=False):
         for cell in cells:
             text = cell.get_text(strip=True)
             text = re.sub(r'Tips', '', text).strip()
-            if text and re.match(r'^[\d-]+$', text) and len(text) >= 3:
+            # Accept 3 or 4 digit results only
+            if text and re.match(r'^\d{3,4}$', text):
                 bazis.append(text)
 
         if not bazis:
@@ -94,16 +104,17 @@ def parse_tables(soup, data, sent, notify=False):
 
         sent_bazis = sent.get(date_key, [])
 
-        # Only send Telegram for TODAY's new results
+        # Telegram only for TODAY IST new results
         if notify and date_key == today_key:
             for i, bazi in enumerate(bazis):
                 if bazi not in sent_bazis:
                     bazi_time = BAZI_TIMES[i] if i < len(BAZI_TIMES) else "--:--"
+                    formatted = format_result(bazi)
                     msg = (
                         f"Kolkata FF Update\n"
                         f"Date: {date_key}\n"
                         f"Time: {bazi_time}\n"
-                        f"Result: {bazi}"
+                        f"Result: {formatted}"
                     )
                     send_telegram(msg)
                     sent_bazis.append(bazi)
@@ -123,24 +134,33 @@ def scrape_month(month_name, year, data, sent):
         print(f"Error scraping {month_name} {year}: {e}")
 
 def scrape_history():
-    """Runs once on startup — loads 3 months, no Telegram"""
+    """Runs once on startup — loads 3 months, zero Telegram"""
     data = load_data()
     sent = load_sent()
+
+    # Mark ALL existing data as already sent so nothing spams
+    for date_key, bazis in data.items():
+        if date_key not in sent:
+            sent[date_key] = bazis[:]
 
     month_names = ["January","February","March","April","May","June",
                    "July","August","September","October","November","December"]
 
-    today = datetime.now()
+    today = get_ist_now()
     for i in range(3):
         d = today - timedelta(days=30*i)
         scrape_month(month_names[d.month - 1], d.year, data, sent)
+
+    # Mark all history as sent so Telegram never fires for old data
+    for date_key, bazis in data.items():
+        sent[date_key] = bazis[:]
 
     save_data(data)
     save_sent(sent)
     print(f"History loaded — {len(data)} days stored")
 
 def scrape():
-    """Runs every 90 mins — sends Telegram only for today's new bazis"""
+    """Runs every 90 mins — Telegram only for today's new bazis"""
     data = load_data()
     sent = load_sent()
 
@@ -151,7 +171,7 @@ def scrape():
         parse_tables(soup, data, sent, notify=True)
         save_data(data)
         save_sent(sent)
-        print(f"[{datetime.now()}] Scraped OK — {len(data)} days stored")
+        print(f"[{get_ist_now()}] IST Scraped OK — {len(data)} days stored")
     except Exception as e:
         print(f"Scrape error: {e}")
 
@@ -172,12 +192,22 @@ def results():
 @app.route("/today")
 def today():
     data = load_data()
-    today_key = datetime.now().strftime("%d/%m/%Y")
+    today_key = get_ist_now().strftime("%d/%m/%Y")
     return jsonify({today_key: data.get(today_key, [])})
 
+@app.route("/reset-sent")
+def reset_sent():
+    """Hit this once to clear spam — then ignore"""
+    data = load_data()
+    sent = {}
+    for date_key, bazis in data.items():
+        sent[date_key] = bazis[:]
+    save_sent(sent)
+    return f"sent.json reset — {len(sent)} dates marked as already sent"
+
 if __name__ == "__main__":
-    scrape_history()  # Silent — no Telegram
-    scrape()          # Today only — Telegram fires for new bazis
+    scrape_history()
+    scrape()
     scheduler = BackgroundScheduler()
     scheduler.add_job(scrape, "interval", minutes=90)
     scheduler.start()
